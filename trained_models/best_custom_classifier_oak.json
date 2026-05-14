@@ -1,0 +1,17 @@
+{
+  "model_path": "/home/tuibui/collect_image/trained_models/best_custom_classifier.keras",
+  "onnx_path": "/home/tuibui/collect_image/trained_models/best_custom_classifier_oak.onnx",
+  "input_name": "input",
+  "input_shape": [
+    1,
+    3,
+    224,
+    224
+  ],
+  "input_layout": "nchw",
+  "dtype": "float32",
+  "opset": 13,
+  "outputs": [
+    "model/dense_1/Softmax:0"
+  ]
+}
