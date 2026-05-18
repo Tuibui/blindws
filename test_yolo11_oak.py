@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Test the trained YOLO11n banknote detector on OAK-D-Lite (depthai 3.x).
 
-Host-side post-processing (no Luxonis JSON config needed).
-Controls: q to quit.
+Uses NN Archive (.tar.xz) + DetectionNetwork. Everything (preprocess, inference,
+decode, NMS) runs on-chip; we just draw boxes.
+
+NN Archive is produced by https://tools.luxonis.com (upload best.pt, target=RVC2,
+size=416, YOLO11) OR locally via the `tools` CLI (luxonis/tools repo).
+
+Controls: q to quit, +/- to adjust global confidence.
 """
 from __future__ import annotations
 
@@ -12,176 +17,130 @@ from pathlib import Path
 
 import cv2
 import depthai as dai
-import numpy as np
 
 REPO = Path(__file__).resolve().parent
-DEFAULT_BLOB = REPO / "trained_models" / "best.blob"
+DEFAULT_ARCHIVE = REPO / "trained_models" / "best.rvc2.tar.xz"
 
-# YOLO id -> human label (guessed at training; override once verified by eye)
-CLASS_NAMES = {0: "20", 1: "50", 2: "100", 3: "500", 4: "1000"}
-NUM_CLASSES = len(CLASS_NAMES)
+# Mapping is intrinsic to the model; DetectionNetwork.getClasses() returns names
+# from the NN Archive, but we keep this human-friendly override here.
+CLASS_NAMES_OVERRIDE = {0: "20", 1: "50", 2: "100", 3: "500", 4: "1000"}
 
-INPUT_W = INPUT_H = 416   # matches training/train.py imgsz=416
+INPUT_W = INPUT_H = 416   # must match the size you converted at on tools.luxonis.com
 
-# Per-class confidence threshold. Tune each index independently.
+# Per-class confidence threshold (applied on host AFTER device NMS).
+# Tune each index independently; +/- hotkeys shift them all by the same delta.
 CONF_THRES_PER_CLASS = {
-    0: 0.50,   # 20
-    1: 0.80,   # 50
-    2: 0.3,   # 100
-    3: 0.6,   # 500
-    4: 0.60,   # 1000
+    0: 0.20,   # 20
+    1: 0.20,   # 50
+    2: 0.40,   # 100
+    3: 0.20,   # 500
+    4: 0.20,   # 1000
 }
-# Vectorised lookup; default to 1.0 (reject) for any unknown class id
-CONF_THRES_VEC = np.array(
-    [CONF_THRES_PER_CLASS.get(i, 1.0) for i in range(len(CLASS_NAMES))],
-    dtype=np.float32,
-)
-IOU_THRES = 0.05
+# Device-side threshold: keep low so all candidates reach the host for per-class filtering.
+DEVICE_CONF_THRES = min(CONF_THRES_PER_CLASS.values())
+
+# OAK-D-Lite is mounted upside down on your rig
+ROTATE = dai.CameraImageOrientation.ROTATE_180_DEG
+# Resize behaviour for preprocessing. CROP keeps aspect ratio + crops centre
+# (matches CiRA dataset's square framing best). LETTERBOX adds gray bars;
+# STRETCH distorts.
+RESIZE_MODE = dai.ImgResizeMode.CROP
 
 
-def nms(boxes: np.ndarray, scores: np.ndarray, iou_thres: float) -> list[int]:
-    if len(boxes) == 0:
-        return []
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(int(i))
-        if order.size == 1:
-            break
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
-        order = order[1:][iou < iou_thres]
-    return keep
+def passes(d, thres_by_class: dict[int, float]) -> bool:
+    return d.confidence >= thres_by_class.get(int(d.label), 1.0)
 
 
-def decode_yolo11(out: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Raw YOLO11 head -> (boxes_xyxy_norm, scores, class_ids).
-
-    Ultralytics YOLO11 output is (1, 4+nc, N) -- 4 bbox channels in pixels +
-    nc class scores (already sigmoid). N = sum of grid sizes (3549 for 416 input).
-    Some exports swap to (1, N, 4+nc), so we sniff the layout.
-    """
-    if out.ndim == 3 and out.shape[1] == 4 + NUM_CLASSES:
-        data = out[0]                       # (4+nc, N)
-    elif out.ndim == 3 and out.shape[2] == 4 + NUM_CLASSES:
-        data = out[0].T                     # (4+nc, N)
-    else:
-        raise RuntimeError(f"unexpected YOLO11 output shape: {out.shape}")
-
-    cx, cy, w, h = data[0], data[1], data[2], data[3]
-    cls_scores = data[4:4 + NUM_CLASSES]
-    class_ids = cls_scores.argmax(axis=0)
-    scores = cls_scores.max(axis=0)
-
-    # Per-class threshold: each anchor must beat its own winning class's threshold
-    mask = scores >= CONF_THRES_VEC[class_ids]
-    if not mask.any():
-        return np.zeros((0, 4)), np.zeros(0), np.zeros(0, dtype=int)
-
-    cx, cy, w, h = cx[mask], cy[mask], w[mask], h[mask]
-    scores = scores[mask]
-    class_ids = class_ids[mask]
-
-    x1 = (cx - w / 2) / INPUT_W
-    y1 = (cy - h / 2) / INPUT_H
-    x2 = (cx + w / 2) / INPUT_W
-    y2 = (cy + h / 2) / INPUT_H
-    boxes = np.clip(np.stack([x1, y1, x2, y2], axis=1), 0.0, 1.0)
-    return boxes, scores, class_ids
-
-
-def draw_detections(frame, boxes, scores, class_ids) -> None:
+def draw_detections(frame, detections, names, thres_by_class) -> None:
     H, W = frame.shape[:2]
-    for (x1n, y1n, x2n, y2n), s, cid in zip(boxes, scores, class_ids):
-        x1, y1 = int(x1n * W), int(y1n * H)
-        x2, y2 = int(x2n * W), int(y2n * H)
+    for d in detections:
+        if not passes(d, thres_by_class):
+            continue
+        x1, y1 = int(d.xmin * W), int(d.ymin * H)
+        x2, y2 = int(d.xmax * W), int(d.ymax * H)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"{CLASS_NAMES.get(int(cid), str(int(cid)))} {s:.2f}"
+        label = f"{names.get(d.label, str(d.label))} {d.confidence:.2f}"
         cv2.putText(frame, label, (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--blob", default=str(DEFAULT_BLOB))
+    ap.add_argument("--archive", default=str(DEFAULT_ARCHIVE),
+                    help="Path to NN Archive (.tar.xz) from tools.luxonis.com")
+    ap.add_argument("--conf", type=float, default=DEVICE_CONF_THRES,
+                    help="On-device confidence floor; per-class thresholds applied on host.")
     args = ap.parse_args()
 
-    blob = Path(args.blob)
-    if not blob.exists():
-        raise SystemExit(f"missing blob: {blob}")
-    print(f"[i] blob: {blob}  ({blob.stat().st_size/1024:.1f} KB)")
+    archive_path = Path(args.archive)
+    if not archive_path.exists():
+        raise SystemExit(
+            f"missing {archive_path}\n"
+            "Convert best.pt at https://tools.luxonis.com (RVC2, 416, YOLO11)\n"
+            "and drop the .tar.xz here."
+        )
+    print(f"[i] archive: {archive_path}  ({archive_path.stat().st_size/1024:.1f} KB)")
 
-    pipe = dai.Pipeline()
+    with dai.Pipeline() as pipe:
+        cam = pipe.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+        cam.setImageOrientation(ROTATE)
 
-    cam = pipe.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-    cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
-    preview = cam.requestOutput(
-        size=(INPUT_W, INPUT_H),
-        type=dai.ImgFrame.Type.RGB888p,   # YOLO trained on RGB; depthai default is BGR
-        fps=30,
-    )
+        archive = dai.NNArchive(str(archive_path))
+        det = pipe.create(dai.node.DetectionNetwork).build(
+            cam, archive, fps=30, resizeMode=RESIZE_MODE,
+        )
+        det.setConfidenceThreshold(args.conf)
 
-    nn = pipe.create(dai.node.NeuralNetwork)
-    nn.setBlobPath(str(blob))
-    nn.setNumInferenceThreads(2)
-    preview.link(nn.input)
+        names_from_archive = det.getClasses() or []
+        # Prefer human-friendly override if it matches in length
+        if names_from_archive and len(CLASS_NAMES_OVERRIDE) == len(names_from_archive):
+            names = CLASS_NAMES_OVERRIDE
+        else:
+            names = {i: n for i, n in enumerate(names_from_archive)} or CLASS_NAMES_OVERRIDE
+        print(f"[i] classes: {names}")
+        print(f"[i] device conf floor: {args.conf}")
+        print(f"[i] per-class thresholds: {CONF_THRES_PER_CLASS}")
 
-    q_rgb = preview.createOutputQueue(maxSize=4, blocking=False)
-    q_nn  = nn.out.createOutputQueue(maxSize=4, blocking=False)
+        q_frame = det.passthrough.createOutputQueue(maxSize=4, blocking=False)
+        q_det = det.out.createOutputQueue(maxSize=4, blocking=False)
 
-    pipe.start()
-    last = time.time()
-    try:
-        while pipe.isRunning():
-            in_nn = q_nn.get()
-            in_rgb = q_rgb.get()
-
-            frame = in_rgb.getCvFrame()
-            tensor = np.asarray(in_nn.getFirstTensor(), dtype=np.float32)
-            # YOLO11n / 5 cls / 416 -> (1, 9, 3549) (or transposed). Add batch dim if missing.
-            if tensor.ndim == 2:
-                tensor = tensor[None, ...]
-            try:
-                if tensor.shape[1] == 4 + NUM_CLASSES or tensor.shape[2] == 4 + NUM_CLASSES:
-                    out = tensor
-                else:
-                    out = tensor.reshape(1, 4 + NUM_CLASSES, -1)
-            except Exception as e:
-                print(f"reshape failed; tensor shape={tensor.shape} layers={in_nn.getAllLayerNames()}: {e}")
-                continue
-
-            boxes, scores, cids = decode_yolo11(out)
-            if len(boxes):
-                keep = nms(boxes, scores, IOU_THRES)
-                boxes, scores, cids = boxes[keep], scores[keep], cids[keep]
-                dets = ", ".join(
-                    f"id={int(c)}({CLASS_NAMES.get(int(c), '?')}) s={s:.2f}"
-                    for c, s in zip(cids, scores)
-                )
-                print(f"[det] {len(boxes)} -> {dets}")
-
-            draw_detections(frame, boxes, scores, cids)
-            now = time.time()
-            fps = 1.0 / max(1e-6, now - last); last = now
-            cv2.putText(frame, f"{fps:5.1f} FPS  {len(boxes)} det", (8, 22),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow("YOLO11n banknote", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    finally:
-        pipe.stop()
+        pipe.start()
+        last = time.time()
+        thres_by_class = dict(CONF_THRES_PER_CLASS)
         try:
-            pipe.wait()
-        except Exception:
-            pass
-        cv2.destroyAllWindows()
+            while pipe.isRunning():
+                in_frame = q_frame.get()
+                in_det = q_det.get()
+                frame = in_frame.getCvFrame()
+                detections = in_det.detections
+
+                shown = [d for d in detections if passes(d, thres_by_class)]
+                if shown:
+                    summary = ", ".join(
+                        f"id={d.label}({names.get(d.label, '?')}) s={d.confidence:.2f}"
+                        for d in shown
+                    )
+                    print(f"[det] {len(shown)} -> {summary}")
+
+                draw_detections(frame, detections, names, thres_by_class)
+
+                now = time.time()
+                fps = 1.0 / max(1e-6, now - last); last = now
+                cv2.putText(frame, f"{fps:5.1f} FPS  {len(shown)} det",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.imshow("YOLO11n banknote", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("+") or key == ord("="):
+                    thres_by_class = {k: min(0.99, v + 0.05) for k, v in thres_by_class.items()}
+                    print(f"[thres] {thres_by_class}")
+                elif key == ord("-") or key == ord("_"):
+                    thres_by_class = {k: max(0.05, v - 0.05) for k, v in thres_by_class.items()}
+                    print(f"[thres] {thres_by_class}")
+        finally:
+            cv2.destroyAllWindows()
     return 0
 
 
